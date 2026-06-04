@@ -1,0 +1,343 @@
+ 
+Сети:
+Устройство	Интерфейс	IP-адрес	Маска	VLAN	Подсеть	Шлюз
+ISP	ens18	DHCP	DHCP	-	DHCP	DHCP
+	ens19	172.16.1.1/28	255.255.255.240	-		-
+	ens20	172.16.2.1/28	255.255.255.240	-		-
+HQ-RTR	int0 (to ISP)	172.16.1.2/28	255.255.255.240	-		
+	int1.100	192.168.2.1/27	255.255.255.224	100		-
+	int1.200	192.168.2.33/27 	255.255.255.224	200		-
+	int1.999	192.168.2.65/29	255.255.255.248	999		-
+	Tunnel.0
+(IP туннель)	192.168.5.1/30
+172.16.1.2-172.16.2.2
+	255.255.255.252	-		-
+BR-RTR	int0 (to ISP)	172.16.2.2/28	255.255.255.240	-		
+	int1 (to BR-SRV)	192.168.3.1/28	255.255.255.240	-		-
+	Tunnel.0
+(IP туннель)	192.168.5.2/30
+172.16.2.2-172.16.1.2
+
+	255.255.255.252	-		-
+HQ-SRV	ens18 (to HQ-RTR)	192.168.2.2/27	255.255.255.224			192.168.2.1/27
+BR-SRV	ens18 (to BR-RTR)	192.168.3.2/28	255.255.255.240	-		192.168.3.1/28
+HQ-CLI	ens18 (to HQ-RTR)	192.168.2.34/27	255.255.255.224	-		192.168.2.33/27
+Модуль 1 — Быстрый готовый конфиг с командами без лишнего 🔥
+#с таким значком ниже будут комментарии для объяснения где надо менять айпи и какой именно айпи. Впринципе чтоб не лохануться смотри всегда на таблицу и сверяй со своим вариантом
+Заточен под реальный стенд на Proxmox в колледже
+🐧 ISP
+hostnamectl set-hostname ISP;exec bash
+
+echo -e "BOOTPROTO=dhcp\nTYPE=eth" > /etc/net/ifaces/ens18/options
+
+vim /etc/net/ifaces/ens18/resolv.conf
+search au-team.irpo
+nameserver 77.88.8.8   #это днс яндекса, этот ip не меняем на экзамене
+sed -i 's/net.ipv4.ip_forward = 0/net.ipv4.ip_forward = 1/' /etc/net/sysctl.conf 
+#vim etc/net/sysctl.conf – поменять 0 на 1
+#!/bin/bash
+set -e
+
+# Создаём каталоги интерфейсов
+mkdir -p /etc/net/ifaces/ens19
+mkdir -p /etc/net/ifaces/ens20
+
+# Настройка ens19 (172.16.1.1/28)
+cat > /etc/net/ifaces/ens19/options << EOF
+TYPE=eth
+BOOTPROTO=static
+HOST=ens19
+EOF
+echo "172.16.1.1/28" > /etc/net/ifaces/ens19/ipv4address
+
+# Настройка ens20 (172.16.2.1/28)
+cat > /etc/net/ifaces/ens20/options << EOF
+TYPE=eth
+BOOTPROTO=static
+HOST=ens20
+EOF
+echo "172.16.2.1/28" > /etc/net/ifaces/ens20/ipv4address
+
+# Включаем IP-форвардинг (маршрутизацию)
+sed -i 's/^net.ipv4.ip_forward\s*=\s*.*/net.ipv4.ip_forward = 1/' /etc/net/sysctl.conf
+grep -q "^net.ipv4.ip_forward" /etc/net/sysctl.conf || echo "net.ipv4.ip_forward = 1" >> /etc/net/sysctl.conf
+sysctl -p /etc/net/sysctl.conf
+
+# Перезапускаем сеть, чтобы поднять интерфейсы
+systemctl restart network
+
+# Часовой пояс (Москва)
+apt-get update
+apt-get install -y tzdata
+timedatectl set-timezone Europe/Moscow
+
+# Установка iptables и правила NAT (маскарадинг через ens18)
+apt-get install -y iptables
+iptables -t nat -A POSTROUTING -o ens18 -j MASQUERADE
+
+# Разрешаем маршрутизацию между ens19/ens20 и ens18
+iptables -A FORWARD -i ens19 -o ens18 -j ACCEPT
+iptables -A FORWARD -i ens20 -o ens18 -j ACCEPT
+iptables -A FORWARD -i ens18 -o ens19 -j ACCEPT
+iptables -A FORWARD -i ens18 -o ens20 -j ACCEPT
+
+# Сохраняем правила iptables (путь для ALT Linux)
+mkdir -p /etc/sysconfig
+iptables-save > /etc/sysconfig/iptables
+
+# Включаем автозагрузку iptables и запускаем
+systemctl enable iptables
+systemctl start iptables
+
+# Финальный перезапуск сети
+systemctl restart network
+
+# Проверка NAT
+iptables -t nat -L -n -v
+🍃 HQ-RTR
+en
+conf t
+hostname hq-rtr.au-team.irpo
+ip domain-name au-team.irpo
+int ISP
+ip address 172.16.1.2/28
+exit
+port te0
+service-instance ISP
+encapsulation untagged
+connect ip interface ISP
+exit
+exit
+int 100
+ip address 192.168.2.1/27
+exit
+int 200
+ip address 192.168.2.33/27
+exit
+int 999
+ip address 192.168.2.65/29
+exit
+port te1
+service-instance 100
+encapsulation dot1q 100
+rewrite pop 1
+connect ip interface 100
+exit
+service-instance 200
+encapsulation dot1q 200
+rewrite pop 1
+connect ip interface 200
+exit
+service-instance 999
+encapsulation dot1q 999
+rewrite pop 1
+connect ip interface 999
+exit
+exit
+ip route 0.0.0.0/0 172.16.1.1
+ntp timezone UTC+3
+exit
+wr
+
+username net_admin
+password P@ssw0rd
+role admin
+
+ip pool dhcp 1
+range 192.168.2.34-192.168.2.62   #тут диапозон адресов для vlan 200, который должен начинаться с адреса hq-cli
+##########################################################################
+Можно скипунть то что в решетках тут, кроме тех кто ↓
+Ниже небольшая обьяснялка этого момента кто запутался и не пон ничего 
+На ipmeter.ru, когда разбили свой адрес на 3 vlan’a
+
+Берем диапозон адресов от подсети vlan 200 и добавляем к нему однёрку (тоесть адрес hq-cli, если вы считали свою табличку так, как в этом примере показано)
+##########################################################################
+dhcp-server 1
+pool dhcp 64
+mask 255.255.255.224	#маска ip адреса vlan 200
+gateway 192.168.2.33   #ip адрес vlan 200
+dns 192.168.2.2     #ip адерес hq-srv
+domain-name au-team.irpo
+ip domain-lookup
+interface 200
+dhcp-server 1
+
+
+ip nat pool nat 192.168.2.1-192.168.2.30,192.168.2.33-192.168.2.62,192.168.2.65-192.168.2.70      # тут с того же ipmeter.ru берем все диапазоны адресов подсетей и пишем сюда через запятую   
+ip nat source dynamic inside-to-outside pool nat overload interface ISP
+
+interface tunnel.1
+ip add 10.10.10.1/30   #ip адрес тунеля может быть любой, советую использовать такой же как тут, но если другой, то он должен быть вроде как всегда на /30 маске (пример: 192.168.5.1/30)
+ip tunnel 172.16.1.2 172.16.2.2 mode gre   #ip адреса hq-rtr и br-rtr соответственно (по порядку), которые ведут на isp
+ip ospf authentication-key P@$$word
+
+router ospf 1
+passive-interface default
+no passive-interface tunnel.1
+network 10.10.10.0/30 area 0  #адрес подсети туннеля. (для примеров ниже, если сам не можешь высчитать адрес подсети, то также на ipmeter при разбивке адресов написаны адреса подсети)
+network 192.168.2.0/27 area 0  #адрес подсети vlan 100
+network 192.168.2.32/27 area 0  #адрес подсети vlan 200
+network 192.168.2.64/29 area 0   #адрес подсети vlan 999
+area 0 authentication
+write memory
+show ip int brief
+🍃 BR-RTR
+en
+conf t
+hostname br-rtr.au-team.irpo
+ip domain-name au-team.irpo
+
+int ISP
+ip address 172.16.2.2/28  #ip адрес br-rtr, который ведет на isp
+ip nat outside
+ex
+port te0
+service-instance ISP
+encapsulation untagged
+connect ip interface ISP
+int 100
+ip address 192.168.3.1/28  #ip адрес br-rtr, который ведет на br-srv
+ip nat inside
+ex
+port te1
+service-instance 100
+encapsulation untagged
+rewrite pop 1
+connect ip int 100
+ip route 0.0.0.0/0 172.16.2.1  #ip isp’а, который ведет на br-rtr (тоесть ens20 интерфейс в табличке сверху)
+
+ip domain-lookup
+show ip int brief 
+
+ntp timezone utc+3
+
+username net_admin
+password P@ssw0rd
+role admin
+
+ip nat pool nat 192.168.3.1-192.168.3.14  #диапазон адресов подсети br-srv, который находится на br-rtr ( тут тоже если запутался, то с ipmeter.ru данные бери)  
+ip nat source dynamic inside-to-outside pool nat overload interface ISP
+
+interface tunnel.1
+ip add 10.10.10.2/30   # ip адрес туннеля, но уже другого устройства. Просто добавляем единичку в конце первого адреса туннеля
+ip tunnel 172.16.2.2 172.16.1.2 mode gre   ##ip адреса br-rtr и hq-rtr соответственно (по порядку), которые ведут на isp
+ip ospf authentication-key P@$$word
+
+router ospf 1
+passive-interface default
+no passive-interface tunnel.1
+network 10.10.10.0/30 area 0.0.0.0   #адрес подсети туннеля
+network 192.168.3.0/28 area 0.0.0.0    #адрес подсети br-srv на br-rtr
+area 0 authentication
+
+write memory
+🐧 HQ-CLI
+hostnamectl set-hostname hq-cli.au-team.irpo;exec bash
+
+systemctl restart network
+
+timedatectl set-timezone Europe/Moscow
+🐧 BR-SRV
+hostnamectl set-hostname br-srv.au-team.irpo;exec bash
+
+vim /etc/net/ifaces/ens18/options
+BOOTPROTO=static
+TYPE=eth
+CONFIG_WIRELESS=no
+SYSTEMD_BOOTPROTO=static
+CONFIG_IPV4=yes
+DISABLED=no
+NM_CONTROLLED=no
+SYSTEMD_CONTROLLED=no
+
+vim /etc/net/ifaces/ens18/resolv.conf
+search au-team.irpo
+nameserver 192.168.2.2   #ip адрес hq-srv
+
+echo 192.168.3.2/28 > /etc/net/ifaces/ens18/ipv4address       #ip адрес br-srv
+echo default via 192.168.3.1 > /etc/net/ifaces/ens18/ipv4route   #ip адрес br-srv на br-rtr, или же шлюз br-srv
+systemctl restart network
+
+timedatectl set-timezone Europe/Moscow
+
+useradd -s /bin/bash -u 2026 sshuser
+echo "sshuser:P@ssw0rd" | chpasswd
+gpasswd -a sshuser wheel
+echo 'sshuser ALL = (root) NOPASSWD: ALL' >> /etc/sudoers
+
+vim /etc/openssh/sshd_config
+Port 2026
+MaxAuthTries 2
+Banner /etc/openssh/banner
+AllowUsers sshuser
+echo Authorized access only > /etc/openssh/banner
+systemctl restart sshd
+vim /etc/apt/apt.conf
+Acquire::http::Proxy "http://10.0.21.52:3128/"     #это прокси колледжа, его не меняем
+Acquire::https::Proxy "http://10.0.21.52:3128/"
+
+🐧 HQ-SRV
+hostnamectl set-hostname hq-srv.au-team.irpo;exec bash
+
+vim /etc/net/ifaces/ens18/options
+BOOTPROTO=static
+TYPE=eth
+CONFIG_WIRELESS=no
+SYSTEMD_BOOTPROTO=static
+CONFIG_IPV4=yes
+DISABLED=no
+NM_CONTROLLED=no
+SYSTEMD_CONTROLLED=no
+
+echo 192.168.2.2/27 > /etc/net/ifaces/ens18/ipv4address  #ip адрес hq-srv
+echo default via 192.168.2.1 > /etc/net/ifaces/ens18/ipv4route   #ip адрес vlan 100 на hq-rtr или же шлюз hq-srv
+vim /etc/net/ifaces/ens18/resolv.conf
+search au-team.irpo
+nameserver 77.88.8.8  #эт тоже днс яндекса, его не меняем
+systemctl restart network
+
+timedatectl set-timezone Europe/Moscow
+
+useradd -s /bin/bash -u 2026 sshuser
+echo "sshuser:P@ssw0rd" | chpasswd
+gpasswd -a sshuser wheel
+echo 'sshuser ALL = (root) NOPASSWD: ALL' >> /etc/sudoers
+
+vim /etc/openssh/sshd_config
+Port 2026
+MaxAuthTries 2
+Banner /etc/openssh/banner
+AllowUsers sshuser
+echo Authorized access only > /etc/openssh/banner
+systemctl restart sshd
+
+apt-get update && apt-get install dnsmasq -y
+echo 'OPTIONS=""' > /etc/sysconfig/dnsmasq
+systemctl restart network
+cat <<'EOT' > /etc/dnsmasq.conf
+no-resolv
+no-poll
+no-hosts
+
+server=77.88.8.7   #эти три строчки,
+server=195.208.4.1  #не меняем
+server=8.8.8.8    #это тоже адреса днс ресурсов
+
+cache-size=1000
+all-servers
+no-negcache
+
+host-record=hq-rtr.au-team.irpo,192.168.2.1  #ip адрес vlan 100 на hq-rtr
+host-record=hq-srv.au-team.irpo,192.168.2.2  #ip адрес hq-srv
+host-record=hq-cli.au-team.irpo,192.168.2.34  #ip адрес hq-cli
+host-record=br-rtr.au-team.irpo,192.168.3.1  #ip адрес br-srv на br-rtr
+host-record=br-srv.au-team.irpo,192.168.3.2  #ip адрес br-srv
+
+address=/docker.au-team.irpo/172.16.1.1   #ip адрес isp’a, которые смотрит на hq-rtr
+address=/web.au-team.irpo/172.16.2.1   #ip адрес isp’a, которые смотрит на br-rtr
+EOT
+systemctl enable --now dnsmasq
+
+vim /etc/apt/apt.conf
+Acquire::http::Proxy "http://10.0.21.52:3128/"    #прокси колледжа, не меняем адреса
+Acquire::https::Proxy "http://10.0.21.52:3128/"
