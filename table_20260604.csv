@@ -1,0 +1,10 @@
+Параметр,Значение
+Имя RAID-устройства,/dev/md0
+Тип RAID,RAID 0 (полоса)
+Участвующие диски,"/dev/sdb, /dev/sdc"
+Размер блока (chunk size),По умолчанию (512 Кб)
+Файловая система,ext4
+Точка монтирования,/raid
+Команда создания,mdadm --create --verbose /dev/md0 --level=0 --raid-devices=2 /dev/sdb /dev/sdc
+Команда для авто-монтирования,UUID=... /raid ext4 defaults 0 0 в /etc/fstab
+Проверка статуса,cat /proc/mdstat; mdadm --detail /dev/md0
