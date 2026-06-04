@@ -1,0 +1,504 @@
+Полный гайд. Модуль 2. Организация сетевого администрирования (Демо 2026)
+Важно: В Модуле 2 стенд уже предварительно настроен (IP, NAT, туннель, OSPF, пользователи sshuser/net_admin, SSH порт 2026, DHCP, DNS). Ваша задача – добавить новые сервисы согласно заданию.
+
+1. Контроллер домена Samba DC на BR-SRV
+bash
+# Установка Samba
+apt-get update && apt-get install -y task-samba-dc
+
+# Остановка и отключение стандартных служб (мешают)
+systemctl stop smb nmb winbind
+systemctl disable smb nmb winbind
+
+# Подготовка домена au-team.irpo
+samba-tool domain provision --use-rfc2307 --realm=AU-TEAM.IRPO --domain=AU-TEAM --adminpass=P@ssw0rd --server-role=dc --dns-backend=SAMBA_INTERNAL
+
+# Перемещаем и настраиваем конфиг
+mv /etc/samba/smb.conf /etc/samba/smb.conf.bak
+cp /var/lib/samba/private/smb.conf /etc/samba/
+
+# Запускаем Samba DC
+systemctl unmask samba-ad-dc
+systemctl enable samba-ad-dc
+systemctl start samba-ad-dc
+
+# Настройка DNS-резолвера клиента (чтобы сам BR-SRV видел свой домен)
+cat > /etc/net/ifaces/ens18/resolv.conf << EOF
+search au-team.irpo
+nameserver 127.0.0.1
+nameserver 192.168.2.2
+EOF
+systemctl restart network
+
+# Создание 5 пользователей hquser1-5 и группы hq
+for i in {1..5}; do
+    samba-tool user create hquser$i P@ssw0rd
+done
+samba-tool group add hq
+for i in {1..5}; do
+    samba-tool group addmembers hq hquser$i
+done
+
+# Ввод машины HQ-CLI в домен (выполнить на HQ-CLI)
+# (Прописано отдельным блоком ниже)
+На HQ-CLI (ввод в домен):
+
+bash
+apt-get update && apt-get install -y task-auth-ad-client
+realm join --user=administrator au-team.irpo
+# пароль Administrator: P@ssw0rd (установлен при provision)
+
+# Настройка автоматического входа пользователей домена (вход по паролю)
+cat > /etc/sssd/sssd.conf << EOF
+[sssd]
+domains = au-team.irpo
+config_file_version = 2
+services = nss, pam
+
+[domain/au-team.irpo]
+ad_domain = au-team.irpo
+krb5_realm = AU-TEAM.IRPO
+realmd_tags = manages-system joined-with-adcli
+cache_credentials = True
+id_provider = ad
+krb5_store_password_if_offline = True
+default_shell = /bin/bash
+ldap_id_mapping = True
+use_fully_qualified_names = False
+fallback_homedir = /home/%u
+access_provider = ad
+ad_access_filter = (|(memberOf=CN=hq,CN=Users,DC=au-team,DC=irpo))
+EOF
+chmod 600 /etc/sssd/sssd.conf
+systemctl restart sssd
+
+# Настройка sudo для группы hq (ограниченные команды)
+echo '%hq ALL=(ALL) /bin/cat, /bin/grep, /usr/bin/id' > /etc/sudoers.d/hq-group
+📌 Пояснения:
+Samba DC работает как контроллер домена Active Directory. samba-tool domain provision создаёт домен au-team.irpo.
+
+На HQ-CLI настраивается SSSD с ad_access_filter, который разрешает вход только членам группы hq.
+
+В sudoers указаны строго три команды (cat, grep, id) – остальные с sudo запускать нельзя.
+
+2. RAID 0 (дисковый массив) на HQ-SRV
+Предполагается, что два диска – /dev/sdb и /dev/sdc (по 1 ГБ). Проверьте имена: lsblk.
+
+bash
+# Установка mdadm
+apt-get update && apt-get install -y mdadm
+
+# Создание RAID 0 из двух дисков
+mdadm --create /dev/md0 --level=0 --raid-devices=2 /dev/sdb /dev/sdc
+
+# Сохранение конфигурации
+mdadm --detail --scan >> /etc/mdadm.conf
+update-initramfs -u
+
+# Создание файловой системы ext4 на /dev/md0
+mkfs.ext4 /dev/md0
+
+# Создание точки монтирования
+mkdir /raid
+
+# Автомонтирование при загрузке
+echo "/dev/md0 /raid ext4 defaults 0 0" >> /etc/fstab
+
+# Монтирование сейчас
+mount /raid
+📌 Пояснение:
+RAID 0 (striping) – повышает производительность, но не отказоустойчив. Для учебных целей допустим.
+
+mdadm.conf хранит описание массива, чтобы он автоматически собирался при загрузке.
+
+3. NFS-сервер на HQ-SRV и автомонтирование на HQ-CLI
+На HQ-SRV:
+
+bash
+# Установка NFS-сервера
+apt-get update && apt-get install -y nfs-utils
+
+# Создание папки для экспорта
+mkdir -p /raid/nfs
+chmod 777 /raid/nfs
+
+# Экспорт только для сети HQ-CLI (192.168.2.32/27)
+echo "/raid/nfs 192.168.2.32/27(rw,sync,no_subtree_check,no_root_squash)" >> /etc/exports
+
+# Запуск и включение сервисов
+systemctl enable --now nfs-server
+exportfs -a
+На HQ-CLI:
+
+bash
+# Установка autofs
+apt-get update && apt-get install -y autofs nfs-utils
+
+# Настройка автомонтирования
+mkdir /mnt/nfs
+cat > /etc/auto.master << EOF
+/mnt/nfs /etc/auto.nfs --timeout=60
+EOF
+
+cat > /etc/auto.nfs << EOF
+nfs -fstype=nfs,rw,vers=3 192.168.2.2:/raid/nfs
+EOF
+
+systemctl restart autofs
+
+# Проверка: cd /mnt/nfs/nfs (должно смонтироваться автоматически)
+📌 Пояснение:
+no_root_squash разрешает root клиента доступ с правами root на сервере – для упрощения.
+
+Autofs монтирует при обращении и отмонтирует через 60 секунд простоя.
+
+4. Служба времени chrony на ISP (и клиенты)
+На ISP (ALT Linux):
+
+bash
+apt-get update && apt-get install -y chrony
+
+# Настройка chrony
+cat > /etc/chrony.conf << EOF
+# Вышестоящий NTP-сервер (любой публичный)
+pool 0.ru.pool.ntp.org iburst
+
+# Разрешаем клиентам из локальных сетей
+allow 172.16.1.0/28
+allow 172.16.2.0/28
+allow 192.168.0.0/16
+
+# Сервер 5 стратума
+local stratum 5
+
+# Файлы
+driftfile /var/lib/chrony/drift
+logdir /var/log/chrony
+EOF
+
+systemctl enable --now chronyd
+На клиентах (HQ-SRV, HQ-CLI, BR-RTR, BR-SRV) – настройка NTP-клиента:
+
+Linux (HQ-SRV, HQ-CLI, BR-SRV):
+
+bash
+apt-get update && apt-get install -y chrony
+cat > /etc/chrony.conf << EOF
+server 172.16.1.1 iburst
+pool 0.ru.pool.ntp.org iburst
+driftfile /var/lib/chrony/drift
+logdir /var/log/chrony
+EOF
+systemctl enable --now chronyd
+EcoRouter (BR-RTR):
+
+bash
+en
+conf t
+ntp server 172.16.1.1
+ntp enable
+exit
+wr mem
+5. Ansible на BR-SRV
+bash
+# Установка ansible
+apt-get update && apt-get install -y ansible
+
+# Создание рабочего каталога
+mkdir -p /etc/ansible
+
+# Создание инвентаря
+cat > /etc/ansible/hosts << EOF
+[all]
+hq-srv.au-team.irpo ansible_host=192.168.2.2 ansible_user=sshuser ansible_port=2026
+hq-cli.au-team.irpo ansible_host=192.168.2.34 ansible_user=sshuser ansible_port=2026
+hq-rtr.au-team.irpo ansible_host=172.16.1.2 ansible_user=net_admin
+br-rtr.au-team.irpo ansible_host=172.16.2.2 ansible_user=net_admin
+
+[linux]
+hq-srv.au-team.irpo
+hq-cli.au-team.irpo
+
+[ecorouter]
+hq-rtr.au-team.irpo
+br-rtr.au-team.irpo
+EOF
+
+# Создание ansible.cfg (отключить проверку ключей хостов для EcoRouter)
+cat > /etc/ansible/ansible.cfg << EOF
+[defaults]
+host_key_checking = False
+inventory = /etc/ansible/hosts
+EOF
+
+# Настройка SSH-ключа для sshuser (если парольный доступ, можно установить sshpass)
+apt-get install -y sshpass
+
+# Проверка связи (ping модуль)
+ansible all -m ping -k   # -k запросит пароль sshuser (P@ssw0rd) и net_admin (P@ssw0rd)
+# После первого раза можно сохранить ключи, но для модуля 2 достаточно пароля.
+
+# Для автоматизации – создать ключ и скопировать:
+ssh-keygen -t rsa -N "" -f /root/.ssh/id_rsa
+ssh-copy-id -p 2026 sshuser@192.168.2.2   # и так для каждого хоста
+📌 Пояснение:
+Файл инвентаря содержит все четыре хоста с правильными IP, пользователями и портами SSH.
+
+Для EcoRouter используется порт 22 по умолчанию (не меняли).
+
+Команда ansible all -m ping должна вернуть "pong" без ошибок.
+
+6. Docker-стек (testapp + mariadb) на BR-SRV
+bash
+# Установка docker
+apt-get update && apt-get install -y docker docker-compose
+
+# Распаковка образов из Additional.iso (монтируем или копируем)
+# Предположим, образы site_latest.tar и mariadb_latest.tar лежат в /root/docker/
+docker load < /root/docker/site_latest.tar
+docker load < /root/docker/mariadb_latest.tar
+
+# Создание docker-compose.yml
+mkdir /opt/testapp
+cd /opt/testapp
+cat > docker-compose.yml << EOF
+version: '3'
+services:
+  db:
+    image: mariadb:latest
+    container_name: db
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: testdb
+      MYSQL_USER: test
+      MYSQL_PASSWORD: P@ssw0rd
+    volumes:
+      - db_data:/var/lib/mysql
+    restart: always
+
+  testapp:
+    image: site:latest
+    container_name: testapp
+    ports:
+      - "8080:80"
+    environment:
+      DB_HOST: db
+      DB_USER: test
+      DB_PASSWORD: P@ssw0rd
+      DB_NAME: testdb
+    depends_on:
+      - db
+    restart: always
+
+volumes:
+  db_data:
+EOF
+
+# Запуск стека
+docker-compose up -d
+
+# Проверка
+docker ps
+curl localhost:8080
+📌 Пояснение:
+Имена контейнеров: testapp и db (строго по заданию).
+
+Приложение доступно на порту 8080 хоста BR-SRV.
+
+7. Веб-приложение (Apache + MariaDB) на HQ-SRV
+bash
+# Установка apache, mariadb, php
+apt-get update && apt-get install -y apache2 mariadb-server php php-mysql
+
+# Запуск БД
+systemctl enable --now mariadb
+
+# Безопасная установка (задаём пароль root)
+mysql_secure_installation
+# (на все вопросы – yes, задать root пароль P@ssw0rd)
+
+# Импорт дампа (dump.sql лежит в web-директории Additional.iso)
+mysql -u root -pP@ssw0rd < /path/to/dump.sql
+
+# Создание пользователя web и прав
+mysql -u root -pP@ssw0rd << EOF
+CREATE USER 'web'@'localhost' IDENTIFIED BY 'P@ssw0rd';
+GRANT ALL PRIVILEGES ON webdb.* TO 'web'@'localhost';
+FLUSH PRIVILEGES;
+EOF
+
+# Копирование файлов приложения в веб-каталог
+cp /path/to/web/index.php /var/www/html/
+cp -r /path/to/web/images /var/www/html/
+
+# Редактирование index.php: указать параметры БД
+# (замените строки подключения на:
+# $db_host = 'localhost';
+# $db_user = 'web';
+# $db_password = 'P@ssw0rd';
+# $db_name = 'webdb';
+)
+
+# Запуск Apache
+systemctl enable --now apache2
+📌 Пояснение:
+MariaDB – отдельный сервер, не в контейнере.
+
+Дамп dump.sql создаёт структуру и наполнение БД webdb.
+
+Пользователь web имеет полный доступ к webdb.
+
+8. Статическая трансляция портов (на EcoRouter)
+На HQ-RTR:
+
+bash
+en
+conf t
+# Проброс 8080 (внешний) -> 8080 на HQ-SRV (веб-приложение)
+ip nat inside source static tcp 192.168.2.2 8080 interface ISP 8080
+# Проброс 2026 -> 2026 на HQ-SRV (SSH)
+ip nat inside source static tcp 192.168.2.2 2026 interface ISP 2026
+exit
+wr mem
+На BR-RTR:
+
+bash
+en
+conf t
+# Проброс 8080 -> 8080 на BR-SRV (testapp)
+ip nat inside source static tcp 192.168.3.2 8080 interface ISP 8080
+# Проброс 2026 -> 2026 на BR-SRV (SSH)
+ip nat inside source static tcp 192.168.3.2 2026 interface ISP 2026
+exit
+wr mem
+📌 Пояснение:
+Статический NAT для отдельных портов (проброс портов). Любой запрос на внешний IP маршрутизатора (172.16.1.2 или 172.16.2.2) на указанный порт перенаправляется на внутренний сервер.
+
+9. Nginx как обратный прокси на ISP
+bash
+# Установка nginx
+apt-get update && apt-get install -y nginx
+
+# Конфигурация
+cat > /etc/nginx/sites-available/proxy << EOF
+server {
+    listen 80;
+    server_name web.au-team.irpo;
+    location / {
+        proxy_pass http://172.16.1.2:8080;   # HQ-RTR пробрасывает на HQ-SRV:8080
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+
+server {
+    listen 80;
+    server_name docker.au-team.irpo;
+    location / {
+        proxy_pass http://172.16.2.2:8080;   # BR-RTR пробрасывает на BR-SRV:8080
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+EOF
+
+# Удаляем default и включаем proxy
+rm /etc/nginx/sites-enabled/default
+ln -s /etc/nginx/sites-available/proxy /etc/nginx/sites-enabled/
+nginx -t
+systemctl restart nginx
+📌 Пояснение:
+Nginx слушает 80 порт. При обращении к web.au-team.irpo проксирует запрос на порт 8080 маршрутизатора HQ-RTR, который уже проброшен внутрь на HQ-SRV.
+
+Аналогично для docker.au-team.irpo – на BR-RTR:8080 → BR-SRV:8080.
+
+10. Web-based аутентификация на ISP (для web.au-team.irpo)
+bash
+# Установка apache2-utils для htpasswd
+apt-get install -y apache2-utils
+
+# Создание файла паролей
+htpasswd -c /etc/nginx/.htpasswd WEB
+# Вводим пароль P@ssw0rd
+
+# Редактируем конфиг nginx для web.au-team.irpo
+cat > /etc/nginx/sites-available/proxy << EOF
+server {
+    listen 80;
+    server_name web.au-team.irpo;
+    auth_basic "Restricted Access";
+    auth_basic_user_file /etc/nginx/.htpasswd;
+    location / {
+        proxy_pass http://172.16.1.2:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+
+server {
+    listen 80;
+    server_name docker.au-team.irpo;
+    location / {
+        proxy_pass http://172.16.2.2:8080;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
+EOF
+
+nginx -t && systemctl restart nginx
+📌 Пояснение:
+auth_basic включает базовую HTTP-аутентификацию.
+
+Файл .htpasswd хранит логин WEB с хешем пароля P@ssw0rd.
+
+При попытке открыть web.au-team.irpo браузер запросит логин и пароль.
+
+11. Установка Яндекс Браузера на HQ-CLI
+bash
+# Скачивание (возможны варианты, но в демо-стенде обычно есть файл в Additional.iso)
+# Если файл .deb есть на образе:
+apt-get update && apt-get install -f -y
+dpkg -i /path/to/yandex-browser-stable_*.deb
+
+# Если нет – через репозиторий (но на экзамене могут быть ограничения)
+# В отчёте достаточно указать, что браузер установлен, и сделать скриншот о рабочем столе.
+📌 Пояснение:
+Установка через dpkg – самый надёжный способ при наличии .deb файла.
+
+После установки приложение появляется в меню или можно запустить командой yandex-browser.
+
+📊 Таблица для отчёта (пример, пункт 1)
+Действие	Команда / Файл
+Установка Samba DC	apt-get install task-samba-dc
+Создание домена	samba-tool domain provision ...
+Пользователи	samba-tool user create hquser1 P@ssw0rd
+Группа hq	samba-tool group add hq
+Ввод HQ-CLI в домен	realm join --user=administrator au-team.irpo
+Ограничение sudo	/etc/sudoers.d/hq-group с %hq ALL=(ALL) /bin/cat, /bin/grep, /usr/bin/id
+Аналогичные таблицы – для каждого пункта с ключевыми параметрами (стратум, порты проброса, имена контейнеров, пути монтирования и т.д.).
+
+✅ Финальная проверка
+Домен: kinit hquser1 на HQ-CLI (должен получить билет).
+
+RAID: df -h /raid – 2 ГБ, cat /proc/mdstat – статус active.
+
+NFS: mount | grep nfs на HQ-CLI после обращения к /mnt/nfs/nfs.
+
+Chrony: chronyc sources на клиентах – виден сервер ISP (172.16.1.1).
+
+Ansible: ansible all -m ping – все pong.
+
+Docker: docker ps – оба контейнера запущены, curl localhost:8080 – ответ приложения.
+
+Apache на HQ-SRV: открыть в браузере http://192.168.2.2 – работает.
+
+Проброс портов: из внешней сети (например, с ISP) выполнить curl http://172.16.1.2:8080 – доступ к testapp.
+
+Nginx на ISP: curl -H 'Host: web.au-team.irpo' http://localhost – ответ с аутентификацией.
+
+Аутентификация: curl -u WEB:P@ssw0rd http://localhost – доступ к веб-приложению.
+
+Яндекс Браузер: запуск из меню или yandex-browser.
+
+Все команды даны в предположении, что предварительные настройки (IP, DNS, маршрутизация, пользователи) уже выполнены. Если что-то не работает – сверьте IP-адреса и имена хостов с вашей таблицей. Удачи на экзамене!
